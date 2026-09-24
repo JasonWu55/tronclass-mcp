@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tronclass-mcp"
+version = "0.1.0"
+description = "A local MCP server for TronClass/CAS APIs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0.0,<2.0.0",
+  "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+tronclass-mcp = "tronclass_mcp:main"
+
+[tool.setuptools]
+py-modules = ["tronclass_mcp", "tronclass_api_catalog"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
