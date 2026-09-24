@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tronclass-mcp"
 version = "0.1.0"
-description = "A local MCP server for TronClass/CAS APIs."
+description = "An MCP server (stdio or HTTP) for TronClass/CAS APIs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

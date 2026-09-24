@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -126,10 +128,28 @@ class TronClassClient:
         path = Path(file_path).expanduser().resolve()
         if not path.is_file():
             raise TronClassError(f"Upload file not found: {path}")
-        upload_name = name or path.name
+        return self.upload_bytes(
+            path.read_bytes(),
+            name or path.name,
+            parent_type=parent_type,
+            parent_id=parent_id,
+            source=source,
+        )
+
+    def upload_bytes(
+        self,
+        content: bytes,
+        name: str,
+        *,
+        parent_type: Optional[str] = None,
+        parent_id: int = 0,
+        source: str = "",
+    ) -> dict[str, Any]:
+        """Upload in-memory file content to TronClass resource storage and mark it uploaded."""
+        upload_name = name
         create_body = {
             "name": upload_name,
-            "size": path.stat().st_size,
+            "size": len(content),
             "parent_type": parent_type,
             "parent_id": parent_id,
             "is_scorm": False,
@@ -146,13 +166,12 @@ class TronClassClient:
         upload_id = upload.get("id")
         if not upload_url or not upload_id:
             return {"ok": False, "stage": "create_upload", "result": created, "error": "Missing upload_url or id"}
-        with path.open("rb") as handle:
-            response = requests.put(
-                upload_url,
-                files={"file": (upload_name, handle, "application/octet-stream")},
-                timeout=self.config.request_timeout,
-                verify=self.config.verify_tls,
-            )
+        response = requests.put(
+            upload_url,
+            files={"file": (upload_name, content, "application/octet-stream")},
+            timeout=self.config.request_timeout,
+            verify=self.config.verify_tls,
+        )
         if not response.ok:
             return {
                 "ok": False,
@@ -553,7 +572,7 @@ def _tool_call(
     return _json(_compact_result(result, compact_key))
 
 
-def create_mcp_server(client: Optional[TronClassClient] = None) -> "FastMCP":
+def create_mcp_server(client: Optional[TronClassClient] = None, **settings: Any) -> "FastMCP":
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server requires the 'mcp' package. Install with: pip install -e ."
@@ -567,6 +586,7 @@ def create_mcp_server(client: Optional[TronClassClient] = None) -> "FastMCP":
             "Use raw_api for arbitrary /api calls. "
             "High-level tools cover todos, courses, activities, homework, exams, questionnaires, submissions, notes, grades, bulletins, resources, entries, and calendar workflows."
         ),
+        **settings,
     )
     tron = client or TronClassClient()
 
@@ -839,6 +859,29 @@ def create_mcp_server(client: Optional[TronClassClient] = None) -> "FastMCP":
         )
 
     @mcp.tool()
+    def upload_file_content(
+        name: str,
+        content_base64: str,
+        parent_type: Optional[str] = None,
+        parent_id: int = 0,
+        source: str = "",
+    ) -> str:
+        """Upload base64-encoded file content into TronClass storage. Use this instead of upload_file when the server runs remotely. Returns the upload ID for later submission."""
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise TronClassError(f"content_base64 is not valid base64: {exc}") from exc
+        return _json(
+            tron.upload_bytes(
+                content,
+                name,
+                parent_type=parent_type,
+                parent_id=parent_id,
+                source=source,
+            )
+        )
+
+    @mcp.tool()
     def submit_homework_uploads(
         activity_id: int,
         upload_ids: list[int],
@@ -965,7 +1008,13 @@ def create_mcp_server(client: Optional[TronClassClient] = None) -> "FastMCP":
     return mcp
 
 
-def run_mcp_server(verbose: bool = False) -> None:
+def run_mcp_server(
+    verbose: bool = False,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    token: Optional[str] = None,
+) -> None:
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -978,15 +1027,59 @@ def run_mcp_server(verbose: bool = False) -> None:
         level=logging.DEBUG if verbose else logging.WARNING,
         stream=sys.stderr,
     )
-    server = create_mcp_server()
-    asyncio.run(server.run_stdio_async())
+    if transport == "stdio":
+        server = create_mcp_server()
+        asyncio.run(server.run_stdio_async())
+        return
+
+    # Remote clients such as claude.ai reach the server through a public URL, and every tool
+    # acts with the configured TronClass account, so the endpoint path carries a secret token.
+    if not token:
+        print(
+            "Error: HTTP transport requires a secret token. Set TRONCLASS_MCP_TOKEN or pass --token.\n"
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    server = create_mcp_server(
+        host=host,
+        port=port,
+        streamable_http_path=f"/{token}/mcp",
+        stateless_http=True,
+        # The public hostname of a tunnel or reverse proxy is not known ahead of time;
+        # the secret path is what guards the endpoint.
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    print(f"TronClass MCP listening on http://{host}:{port}/<token>/mcp", file=sys.stderr)
+    server.run(transport="streamable-http")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the TronClass MCP server over stdio.")
+    parser = argparse.ArgumentParser(description="Run the TronClass MCP server.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging to stderr.")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=os.getenv("TRONCLASS_MCP_TRANSPORT", "stdio"),
+        help="stdio for local clients, http (Streamable HTTP) for remote clients such as claude.ai.",
+    )
+    parser.add_argument("--host", default=os.getenv("TRONCLASS_MCP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("TRONCLASS_MCP_PORT", "8000")))
+    parser.add_argument(
+        "--token",
+        default=os.getenv("TRONCLASS_MCP_TOKEN"),
+        help="Secret path segment for the HTTP endpoint (prefer the TRONCLASS_MCP_TOKEN env var).",
+    )
     args = parser.parse_args()
-    run_mcp_server(verbose=args.verbose)
+    run_mcp_server(
+        verbose=args.verbose,
+        transport=args.transport,
+        host=args.host,
+        port=args.port,
+        token=args.token,
+    )
 
 
 if __name__ == "__main__":

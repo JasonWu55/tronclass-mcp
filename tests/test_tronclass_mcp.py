@@ -93,6 +93,19 @@ class StubClient:
         )
         return {"ok": True, "upload": {"id": 123, "name": name or Path(file_path).name}}
 
+    def upload_bytes(self, content, name, *, parent_type=None, parent_id=0, source=""):
+        self.calls.append(
+            {
+                "method": "UPLOAD_BYTES",
+                "content": content,
+                "name": name,
+                "parent_type": parent_type,
+                "parent_id": parent_id,
+                "source": source,
+            }
+        )
+        return {"ok": True, "upload": {"id": 124, "name": name}}
+
     def submit_homework_uploads(self, activity_id, upload_ids, *, comment="", draft=False, user_id=None):
         self.calls.append(
             {
@@ -391,6 +404,26 @@ class TestMcpServer:
             "source": "",
         }
 
+    def test_upload_file_content_tool_decodes_base64(self):
+        client = StubClient()
+        server = tronclass_mcp.create_mcp_server(client=client)
+
+        result = _run_tool(
+            server,
+            "upload_file_content",
+            {"name": "HW.pdf", "content_base64": "cGRm", "parent_type": "homework", "parent_id": 7},
+        )
+
+        assert result["upload"]["id"] == 124
+        assert client.calls[-1] == {
+            "method": "UPLOAD_BYTES",
+            "content": b"pdf",
+            "name": "HW.pdf",
+            "parent_type": "homework",
+            "parent_id": 7,
+            "source": "",
+        }
+
     def test_submit_homework_uploads_tool_delegates_to_client(self):
         client = StubClient()
         server = tronclass_mcp.create_mcp_server(client=client)
@@ -449,3 +482,9 @@ class TestMain:
         with patch.object(tronclass_mcp, "_MCP_SERVER_AVAILABLE", False):
             with pytest.raises(SystemExit):
                 tronclass_mcp.run_mcp_server()
+
+    def test_http_transport_requires_token(self):
+        with patch.object(tronclass_mcp, "create_mcp_server") as create:
+            with pytest.raises(SystemExit):
+                tronclass_mcp.run_mcp_server(transport="http", token=None)
+        create.assert_not_called()
