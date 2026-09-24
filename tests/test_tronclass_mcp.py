@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 from pathlib import Path
@@ -488,3 +489,19 @@ class TestMain:
             with pytest.raises(SystemExit):
                 tronclass_mcp.run_mcp_server(transport="http", token=None)
         create.assert_not_called()
+
+    def test_load_dotenv_does_not_override_existing(self, tmp_path, monkeypatch):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "# comment\nTRONCLASS_USERNAME='student'\nexport TRONCLASS_MCP_PORT=9000\nTRONCLASS_PASSWORD=from_file\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TRONCLASS_USERNAME", raising=False)
+        monkeypatch.delenv("TRONCLASS_MCP_PORT", raising=False)
+        monkeypatch.setenv("TRONCLASS_PASSWORD", "from_shell")
+
+        tronclass_mcp.load_dotenv(env_file, tmp_path / "missing.env")
+
+        assert os.environ["TRONCLASS_USERNAME"] == "student"
+        assert os.environ["TRONCLASS_MCP_PORT"] == "9000"
+        assert os.environ["TRONCLASS_PASSWORD"] == "from_shell"

@@ -42,6 +42,8 @@ For claude.ai on the web, run it over HTTP instead. See [claude.ai (web)](#claud
 
 ## Configuration
 
+Settings can come from the environment or from a `.env` file (copy `.env.example`). The file is read from the current directory or the folder containing `tronclass_mcp.py`, and real environment variables take precedence. On Windows PowerShell, set variables with `$env:TRONCLASS_USERNAME = 'YOUR_STUDENT_ID'` instead of `export`.
+
 | Environment variable | Required | Default | Description |
 |---|---:|---|---|
 | `TRONCLASS_USERNAME` | Yes | — | TronClass/CAS username or student ID. |

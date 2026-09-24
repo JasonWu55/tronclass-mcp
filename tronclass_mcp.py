@@ -76,6 +76,23 @@ class TronClassConfig:
             )
 
 
+def load_dotenv(*paths: Path) -> None:
+    """Load KEY=VALUE lines from .env files without overriding variables already set."""
+    for path in paths:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.removeprefix("export ").strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -1057,6 +1074,7 @@ def run_mcp_server(
 
 
 def main() -> None:
+    load_dotenv(Path.cwd() / ".env", Path(__file__).resolve().parent / ".env")
     parser = argparse.ArgumentParser(description="Run the TronClass MCP server.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging to stderr.")
     parser.add_argument(
