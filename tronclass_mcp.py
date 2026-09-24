@@ -4,15 +4,19 @@ import argparse
 import asyncio
 import base64
 import binascii
+import html
+import io
 import json
 import logging
 import os
+import re
 import sys
 import threading
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import requests
 
@@ -23,6 +27,7 @@ logger = logging.getLogger("tronclass.mcp")
 _MCP_SERVER_AVAILABLE = False
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ImageContent, TextContent
 
     _MCP_SERVER_AVAILABLE = True
 except ImportError:
@@ -37,6 +42,12 @@ DEFAULT_API_USER_AGENT = (
 )
 _SAFE_HEADER_KEYS = {"content-type", "x-session-id", "set-cookie", "location"}
 _DEFAULT_GROUP_LIMIT = 100
+_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".java",
+    ".c", ".h", ".cpp", ".js", ".ts", ".sql", ".r", ".m", ".ipynb", ".yaml", ".yml",
+}
+_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 
 
 class TronClassError(RuntimeError):
@@ -295,6 +306,52 @@ class TronClassClient:
         verify = self.get_peer_submission(activity_id, submitter_id)
         return {"ok": bool(result.get("ok")), "result": result, "submission": verify.get("data")}
 
+    def download_upload(
+        self,
+        *,
+        upload_id: Optional[int] = None,
+        reference_id: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Download an uploaded file's bytes by upload ID or reference ID."""
+        if (upload_id is None) == (reference_id is None):
+            raise TronClassError("Pass exactly one of upload_id or reference_id.")
+        if upload_id is not None:
+            path = f"/api/uploads/{upload_id}/blob"
+        else:
+            path = f"/api/uploads/reference/{reference_id}/blob"
+
+        self._ensure_logged_in()
+        response = self._request_once("GET", path, allow_redirects=False)
+        if response.status_code == 401:
+            self._ensure_logged_in(force=True)
+            response = self._request_once("GET", path, allow_redirects=False)
+        if response.status_code in (301, 302, 303, 307, 308):
+            # Blobs usually redirect to signed storage URLs; fetch those without the
+            # TronClass session headers so the session ID is not sent to another host.
+            location = urljoin(self.config.base_url + "/", response.headers.get("Location", ""))
+            response = requests.get(
+                location,
+                timeout=self.config.request_timeout,
+                verify=self.config.verify_tls,
+            )
+        if not response.ok:
+            return {
+                "ok": False,
+                "status": response.status_code,
+                "text": response.text[:1000],
+            }
+        content = response.content
+        if len(content) > _MAX_DOWNLOAD_BYTES:
+            raise TronClassError(
+                f"File is {len(content)} bytes; the download limit is {_MAX_DOWNLOAD_BYTES} bytes."
+            )
+        return {
+            "ok": True,
+            "name": _filename_from_disposition(response.headers.get("Content-Disposition", "")),
+            "content_type": response.headers.get("Content-Type", "application/octet-stream"),
+            "content": content,
+        }
+
     def request(
         self,
         method: str,
@@ -342,6 +399,7 @@ class TronClassClient:
         json_body: Optional[dict[str, Any]] = None,
         form_body: Optional[dict[str, Any]] = None,
         headers: Optional[dict[str, str]] = None,
+        allow_redirects: bool = True,
     ) -> requests.Response:
         merged_headers = {
             "Accept": "application/json, text/plain, */*",
@@ -364,6 +422,7 @@ class TronClassClient:
             headers=merged_headers,
             timeout=self.config.request_timeout,
             verify=self.config.verify_tls,
+            allow_redirects=allow_redirects,
         )
         rotated = response.headers.get("x-session-id") or response.headers.get("X-SESSION-ID")
         if rotated:
@@ -564,6 +623,80 @@ def _compact_result(result: dict[str, Any], collection_key: Optional[str] = None
         if "count" not in compact and "item" not in compact:
             compact["data"] = data
     return compact
+
+
+def _filename_from_disposition(disposition: str) -> Optional[str]:
+    match = re.search(r"filename\*=(?:UTF-8'')?([^;]+)", disposition, re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+    match = re.search(r'filename="?([^";]+)"?', disposition, re.IGNORECASE)
+    return unquote(match.group(1)) if match else None
+
+
+def _collect_uploads(data: Any, found: Optional[dict[Any, dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """Walk a TronClass JSON payload and return every attached upload, de-duplicated."""
+    if found is None:
+        found = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in ("uploads", "attachments") and isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and ("id" in item or "reference_id" in item):
+                        found.setdefault(
+                            (item.get("id"), item.get("reference_id")),
+                            {
+                                "upload_id": item.get("id"),
+                                "reference_id": item.get("reference_id"),
+                                "name": item.get("name"),
+                                "size": item.get("size"),
+                                "type": item.get("type"),
+                                "activity_id": data.get("id") if "title" in data else None,
+                                "activity_title": data.get("title"),
+                            },
+                        )
+            else:
+                _collect_uploads(value, found)
+    elif isinstance(data, list):
+        for item in data:
+            _collect_uploads(item, found)
+    return list(found.values())
+
+
+def _xml_text(xml: bytes, paragraph_tag: str) -> str:
+    """Pull visible text from an Office Open XML part, one line per paragraph."""
+    text = re.sub(rf"</{paragraph_tag}>", "\n", xml.decode("utf-8", "replace"))
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def _extract_text(name: str, content_type: str, content: bytes) -> Optional[str]:
+    """Best-effort text extraction for common course material formats."""
+    suffix = Path(name).suffix.lower()
+    if suffix in _TEXT_EXTENSIONS or content_type.startswith("text/"):
+        return content.decode("utf-8", "replace")
+    if suffix == ".pdf" or content_type == "application/pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(content))
+        pages = [f"--- page {index} ---\n{page.extract_text() or ''}" for index, page in enumerate(reader.pages, 1)]
+        return "\n\n".join(pages)
+    if suffix in (".docx", ".pptx", ".xlsx"):
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = archive.namelist()
+            if suffix == ".docx":
+                return _xml_text(archive.read("word/document.xml"), "w:p")
+            if suffix == ".pptx":
+                slides = sorted(
+                    (n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                    key=lambda n: int(re.search(r"\d+", n.rsplit("/", 1)[1]).group()),
+                )
+                return "\n\n".join(
+                    f"--- slide {index} ---\n{_xml_text(archive.read(slide), 'a:p')}"
+                    for index, slide in enumerate(slides, 1)
+                )
+            if "xl/sharedStrings.xml" in names:
+                return _xml_text(archive.read("xl/sharedStrings.xml"), "si")
+    return None
 
 
 def _json(result: dict[str, Any]) -> str:
@@ -897,6 +1030,93 @@ def create_mcp_server(client: Optional[TronClassClient] = None, **settings: Any)
                 source=source,
             )
         )
+
+    @mcp.tool()
+    def list_activity_files(activity_id: int) -> str:
+        """List files attached to an activity (materials, homework instructions). Use download_file to fetch one."""
+        result = tron.request("GET", _item_path("/api/activities", activity_id))
+        if not result.get("ok"):
+            return _json(result)
+        files = _collect_uploads(result.get("data"))
+        return _json({"ok": True, "activity_id": activity_id, "count": len(files), "files": files})
+
+    @mcp.tool()
+    def list_course_files(course_id: int) -> str:
+        """List files attached to every activity in a course. Use download_file to fetch one."""
+        attempts = [
+            (f"/api/courses/{course_id}/activities", None),
+            ("/api/course/activities/", {"course_id": course_id}),
+        ]
+        result: dict[str, Any] = {}
+        for path, params in attempts:
+            result = tron.request("GET", path, params=params)
+            if result.get("ok"):
+                files = _collect_uploads(result.get("data"))
+                return _json(
+                    {"ok": True, "course_id": course_id, "source": path, "count": len(files), "files": files}
+                )
+        return _json(result)
+
+    @mcp.tool()
+    def download_file(
+        upload_id: Optional[int] = None,
+        reference_id: Optional[int] = None,
+        max_chars: int = 100_000,
+        include_base64: bool = False,
+        save_to_download_dir: bool = False,
+    ):
+        """Fetch a TronClass file by upload_id or reference_id (from list_activity_files / list_course_files).
+
+        Text, PDF, DOCX, PPTX and XLSX files come back as extracted text (truncated to max_chars),
+        images come back as images. Other formats return metadata only unless include_base64 is set.
+        save_to_download_dir also writes the file into TRONCLASS_DOWNLOAD_DIR on the server machine.
+        """
+        downloaded = tron.download_upload(upload_id=upload_id, reference_id=reference_id)
+        if not downloaded.get("ok"):
+            return _json(downloaded)
+        content: bytes = downloaded["content"]
+        name = downloaded.get("name") or f"upload-{upload_id or reference_id}"
+        content_type = downloaded["content_type"].split(";")[0].strip()
+        info: dict[str, Any] = {
+            "ok": True,
+            "name": name,
+            "content_type": content_type,
+            "size": len(content),
+        }
+
+        if save_to_download_dir:
+            download_dir = os.getenv("TRONCLASS_DOWNLOAD_DIR")
+            if not download_dir:
+                raise TronClassError("Set TRONCLASS_DOWNLOAD_DIR to enable saving downloads.")
+            target_dir = Path(download_dir).expanduser().resolve()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", Path(name).name) or "download"
+            target = target_dir / safe_name
+            target.write_bytes(content)
+            info["saved_to"] = str(target)
+
+        suffix = Path(name).suffix.lower()
+        image_type = _IMAGE_TYPES.get(suffix) or (content_type if content_type.startswith("image/") else None)
+        if image_type:
+            return [
+                TextContent(type="text", text=_json(info)),
+                ImageContent(type="image", data=base64.b64encode(content).decode(), mimeType=image_type),
+            ]
+
+        try:
+            text = _extract_text(name, content_type, content)
+        except Exception as exc:  # corrupt or unusual files should still return metadata
+            info["extract_error"] = f"{type(exc).__name__}: {exc}"
+            text = None
+        if text is not None:
+            info["chars"] = len(text)
+            info["truncated"] = len(text) > max_chars
+            info["text"] = text[:max_chars]
+        else:
+            info["note"] = "No text extraction for this format."
+            if include_base64:
+                info["content_base64"] = base64.b64encode(content).decode()
+        return _json(info)
 
     @mcp.tool()
     def submit_homework_uploads(

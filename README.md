@@ -21,6 +21,7 @@ A local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server 
 - TronClass account credentials
 - Python packages:
   - `mcp>=1,<2` (the server currently uses the MCP Python SDK v1 FastMCP API)
+  - `pypdf` (PDF text extraction)
   - `requests`
 
 ## Quick start
@@ -53,6 +54,7 @@ Settings can come from the environment or from a `.env` file (copy `.env.example
 | `TRONCLASS_VERIFY_TLS` | No | `true` | Set to `false`, `0`, `no`, or `off` to disable TLS verification. |
 | `TRONCLASS_LOGIN_USER_AGENT` | No | mobile app UA | User-Agent for CAS login requests. |
 | `TRONCLASS_API_USER_AGENT` | No | mobile/common UA | User-Agent for TronClass API requests. |
+| `TRONCLASS_DOWNLOAD_DIR` | No | — | Folder where `download_file` may save files. Saving is disabled when unset. |
 | `TRONCLASS_MCP_TRANSPORT` | No | `stdio` | `stdio` for local clients, `http` for remote clients such as claude.ai. |
 | `TRONCLASS_MCP_HOST` | No | `127.0.0.1` | HTTP bind address. |
 | `TRONCLASS_MCP_PORT` | No | `8000` | HTTP port. |
@@ -186,6 +188,14 @@ Hermes registers tools with the prefix `mcp_tronclass_`, for example `mcp_troncl
 | `upload_file` | Upload a local file into TronClass storage. |
 | `upload_file_content` | Upload base64-encoded content (for remote clients such as claude.ai). |
 | `submit_homework_uploads` | Submit uploaded file IDs to a homework activity. |
+
+### Files
+
+| Tool | Description |
+|---|---|
+| `list_activity_files` | List files attached to an activity, with their `upload_id` and `reference_id`. |
+| `list_course_files` | List files attached to every activity in a course. |
+| `download_file` | Fetch a file by `upload_id` or `reference_id`. Text, PDF, DOCX, PPTX and XLSX come back as extracted text, images as images. With `save_to_download_dir`, it also saves the file into `TRONCLASS_DOWNLOAD_DIR`. |
 
 ### Peer review / mutual evaluation
 
